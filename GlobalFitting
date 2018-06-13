@@ -1,0 +1,979 @@
+%% Does Global Fitting (Using Decay Associated Spectra) As Per Function
+% Global fitting matrix math originally by Orion Pearce
+% Analysis by Jasper Cook and Sam Shepard. See changelog at bottom.
+
+loads = menu('Load New TA Data?','Yes, Load New Data','No, Use Loaded');
+if loads == 1
+    set(0,'DefaultFigureWindowStyle','docked')
+    clear variables
+    [filename,filedir] = uigetfile('*','Choose Processed TA Data');
+    if filedir==0
+        disp('Goodbye')
+        return
+    end
+    cd(filedir)
+    data = dlmread(filename);    
+    FolderName = ['Global Fit 2 ' filename]; % Give the folder a fancy name
+    mkdir(FolderName);
+    cd(FolderName)
+    GFitOpts = {'-inf inf','ps','0.5','100','400 410','1','3','1 15 5300','1','0'}; % QT Table Suggestions
+%     GFitOpts = {'-Inf Inf','ps','0.1','9999','395 405','1','2','','0','0'}; % Clark Table Suggestions
+%     GFitOpts = {'-0.005 0.005','us','0.001','35','800 999','1','2','','1','0'}; % EOS Suggestions
+elseif loads == 2
+    cd([filedir FolderName])
+elseif loads == 0
+    disp('Goodbye')
+    return
+end
+
+%%
+%{a
+GFitPrompts = {...
+    'Z limits (use "-Inf Inf" to autoscale)',...
+    'Time Units (use ps, ns, us, etc.; no special characters.)',...
+    'Time to Start Fit (leave empty to start at first timepoint',...
+    'Time to Stop Fit (leave empty or numbers larger than max time will yield max time)',...
+    ['PUMP SCATTER REGION(S)' newline ...
+    'Leave blank to skip, otherwise enter as:' newline ...
+    'Start1 End1 Start2 End2, etc.'],...
+    ['Fit Type' newline '1 is sum of exponentials' newline ...
+    '2 is cexp' newline '3 is sum of Gaussians' newline ...
+    '4 is sum of ExpModGauss functions' newline ...
+    '5 is variable-temperature UV-Vis' newline ...
+    '6 is binding study'],...
+    ['NUMBER OF SPECIES FOR CHOSEN FIT' newline ...
+    'Type 1 with 3 params = 3 exponentials' newline ...
+    'Type 2 with 5 params = 5 cexps' newline ...
+    'Type 3 with 8 params = 8 Gaussians' newline ...
+    'Type 4 with 2 params = 2 summed ExpModGauss functions' newline ...
+    'Type 5: Must Enter "2"' newline ...
+    'Type 6: Must Enter "3"'],...
+    ['MANUAL PARAMETER GUESSES (leave blank for automatic guesses)' newline ...
+    'Type 1 = tau1, tau2, tau3, etc.' newline ...
+    'Type 2 = sigma, tau1, tau2, tau3, etc.' newline ...
+    'Type 3 = I dunno' newline ...
+    'Type 4 = sigma, t0, tau1, tau2, tau3, etc.' newline ...
+    'Type 5 = DeltaH, DeltaS' newline ...
+    'Type 6 = K'],...
+    'Plot Time Logarithmically? (0 = no; 1 = yes)',...
+    ['Smoothing - Spectral Extrema Estim. (# of neighbors to ave)' newline...
+    '0 to skip. 10-20 is good, but more averaging shifts extrema more.']...
+    };
+
+GFitOpts = inputdlg(GFitPrompts,'Options',1,GFitOpts);
+%}
+if isempty(GFitOpts)
+    disp('Exiting')
+    return
+end
+
+%% Set Parameters
+taumax = 1e6; % longest acceptable lifetime, in TimeUnits. Comment out to use +Inf
+zlims = str2num(GFitOpts{1}); % intensity limits. Use "[-Inf Inf]" to autoscale.
+TimeUnits = GFitOpts{2}; % ps for ultrafast TA, us for Eos, etc. (no special chars)
+tstart = str2double(GFitOpts{3}); % start time
+tend = str2double(GFitOpts{4}); % last time (e.g. "80" for 80us in Eos, or 1600 for 1.6ns on QT table)
+PumpScatter = str2num(GFitOpts{5}); % pump scatter region(s) to remove (list in group & use "[]" to skip)
+fittype = str2double(GFitOpts{6}); % 1 is exponential, 2 is cexp, 3 is gauss, 4 is ExpModGauss, 5 is variable-temperature UV-Vis
+numexps = str2double(GFitOpts{7}); % number of exponentials to use
+SpecSmoothParam = str2double(GFitOpts{10}); % Number of neighbors to average in EAS spectra
+
+if isempty(GFitOpts{8})
+    clear manualguesses
+else
+    manualguesses = str2num(GFitOpts{8});
+end
+TimeAsLog = str2double(GFitOpts{9}); % 1 gives logarithmic time axes; 0 gives linear time axes.
+
+%% Grab Info From The Data
+Fn = GetFigNum();
+
+Times = data(1,2:end); % get TA times
+WLs = data(2:end,1); % get probe wavelengths
+TAMatrix = data(2:end,2:end); % get all TA data
+TStartInd = interp1(Times,1:length(Times),tstart,'nearest','extrap'); % find chosen time
+if isempty(TStartInd)
+    TStartInd=1;
+end
+TEndInd = interp1(Times,1:length(Times),tend,'nearest','extrap'); % find chosen time
+if isempty(TEndInd)
+    TEndInd=length(Times);
+end
+Times = Times(TStartInd:TEndInd); % trim times
+TAMatrix = TAMatrix(:,TStartInd:TEndInd); % trim TA matrix
+for ii = 1:floor(length(PumpScatter)/2)
+    PScatterInd = interp1(WLs,1:length(WLs),PumpScatter(2*ii-1:2*ii),'nearest','extrap');
+    TAMatrix(PScatterInd(1):PScatterInd(2),:) = [];
+    WLs(PScatterInd(1):PScatterInd(2)) = [];
+end
+
+TAMatrix(isnan(TAMatrix)) = 0;
+if zlims(2) == Inf
+    zlims(2) = max(max(TAMatrix)); % just get the largest amplitude
+end
+if zlims(1) == -Inf
+    zlims(1) = min(min(TAMatrix)); % just get the smallest amplitude
+end
+tmax = max(Times); % max time for plotting
+
+%% the actual fitting
+% define the functions you'll use for your fitting:
+clear exponential cexp tau t sigma matrix_make coeff amplitude_fit_function
+clear fit_function fit_options solution
+
+% Create a matrix with your first fit component
+matrix_make = @(coeff) [];
+
+if ~exist('taumax','var')
+    taumax = Inf;
+end
+
+if fittype == 1
+    % for exponential case
+    exponential=@(tau,t) exp(-(t)./tau);
+    guess = [];
+    lower_bounds = [];
+    upper_bounds = [];
+    for ii = 1:numexps
+        matrix_make=@(coeff) [matrix_make(coeff),exponential(coeff(ii),Times)'];
+        guess = [guess 0.1*10^(2*ii-1)]; 
+        lower_bounds = [lower_bounds 0];
+        upper_bounds = [upper_bounds taumax];
+    end
+elseif fittype == 2
+    % for cexp case
+    cexp=@(sigma,tau,t) 0.5.*(1 + erf((t/sigma - sigma/tau)/sqrt(2)))...
+        .*exp(0.5*(sigma/tau)^2-t/tau);
+    guess = 0.01;
+    lower_bounds = 1e-6;
+    upper_bounds = max(Times);
+    for ii = 1:numexps
+        matrix_make=@(coeff) [matrix_make(coeff),cexp(coeff(1),coeff(1+ii),Times)'];
+        guess = [guess 0.1*10^(2*ii-1)];
+        lower_bounds = [lower_bounds 0];
+        upper_bounds = [upper_bounds taumax];
+    end
+elseif fittype == 3
+    gaussfn=@(x0,sigma) 1/(sigma*sqrt(2*pi))*exp(-(t-x0).^2/(2*sigma.^2));
+    guess = [];
+    lower_bounds = [];
+    upper_bounds = [];
+    for ii = 1:numexps
+        matrix_make=@(coeff) [matrix_make(coeff),gaussfn(coeff(1),coeff(1+ii),Times)'];
+        guess = [guess 1*10^(2*ii-1)];
+        lower_bounds = [lower_bounds 0];
+        upper_bounds = [upper_bounds taumax];
+    end
+elseif fittype == 4
+        % for ExpModGauss case
+    EMG=@(sigma,t0,tau,t) ExpModGauss(t,sigma,t0,0,1,tau); % ExpModGauss(t,sigma,t0,y0,varargin)
+    guess = [0.1 0];
+    lower_bounds = [1e-6 -Inf];
+    upper_bounds = [max(Times) Inf];
+    for ii = 1:numexps
+        matrix_make=@(coeff) [matrix_make(coeff),EMG(coeff(1),coeff(2),coeff(2+ii),Times)];
+        guess = [guess 1*10^(2*ii-1)];
+        lower_bounds = [lower_bounds 0];
+        upper_bounds = [upper_bounds taumax];
+    end
+elseif fittype ==5
+    % for fitting of variable-temperature UV-Vis data.
+    numexps = 2;  %Make sure you've specified 2 "exponentials."
+    GasC = 0.008314;
+    K=@(H,S,t) exp((S-H./t)./GasC); % DelG = RT*ln(K)
+    MoleFrac=@(H,S,t) K(H,S,t)./(K(H,S,t)+1); % K/(K+1) = molefrac_HS
+    guess = [24, .092];
+%     lower_bounds = [1 0.01];
+%     upper_bounds = [100 1];
+    lower_bounds = [23 0.091];
+    upper_bounds = [25 0.093];
+    matrix_make=@(coeff) [matrix_make(coeff),MoleFrac(coeff(1),coeff(2),Times)'];
+    matrix_make=@(coeff) [matrix_make(coeff),1-MoleFrac(coeff(1),coeff(2),Times)'];
+else
+    cd('../')
+    [filename,filedir] = uigetfile('*','Choose Initial Concentration File');
+    cd(filedir)
+    C0 = dlmread(filename);
+    Eps1 = TAMatrix(:,1)'/C0(1);
+    [filename,filedir] = uigetfile('*','Load epsilon spectrum of binder');
+    cd(filedir)
+    Eps2Data = dlmread(filename);
+    [Eps2WL,in1,~] = unique(Eps2Data(1,:));
+    Eps2 = Eps2Data(2,in1);
+    InterpEps2 = interp1(Eps2WL,Eps2,WLs,'pchip',0)';
+    matrix_make = @(coeff) [];
+%     Con3=@(K,C0,Eq) OneBound(K,Eq,C0);
+    cd(FolderName)
+    if fittype == 6
+        numexps = 3;  %Make sure you've specified 3 "exponentials."
+        guess = 100;
+        lower_bounds = 1;
+        upper_bounds = 1E6;
+        matrix_make=@(coeff) [matrix_make(coeff),OneBoundy(coeff,Times,C0)'];
+    elseif fittype == 7
+        numexps = 4;  %Make sure you've specified 3 "exponentials."
+        guess = [10000 500];
+        lower_bounds = [1 1];
+        upper_bounds = [1E6 1E6];
+        matrix_make=@(coeff) [matrix_make(coeff),...
+            TwoBound1(coeff(1),coeff(2),C0,Times.*C0)',...
+            TwoBound2(coeff(1),coeff(2),C0,Times.*C0)'];
+    end   
+end
+
+if exist('manualguesses','var')
+    guess = manualguesses;
+end
+if fittype == 6
+    amplitude_fit_function =@(coeff) [Eps1;InterpEps2;(matrix_make(coeff)'*matrix_make(coeff))^-1*...
+        matrix_make(coeff)'*TAMatrix']; %the amplitude fit function now
+        % contains the known basis functions.
+    fit_function =@(coeff,t) [C0'-matrix_make(coeff),(Times.*C0)'-matrix_make(coeff),matrix_make(coeff)]...
+    *amplitude_fit_function(coeff);
+    matrix_make=@(coeff) [C0'-matrix_make(coeff),(Times.*C0)'-matrix_make(coeff),matrix_make(coeff)];
+    % The line above may be confusing. I'm doing this so that KinFitFit has
+    % the proper dimensions (3 by times instead of 1 by times)
+elseif fittype == 7
+    amplitude_fit_function =@(coeff) [Eps1;InterpEps2;(matrix_make(coeff)'*matrix_make(coeff))^-1*...
+        matrix_make(coeff)'*TAMatrix']; %the amplitude fit function now
+        % contains the known basis functions.
+    fit_function =@(coeff,t) [C0'-matrix_make(coeff)*[1;1],...
+        (Times.*C0)'-matrix_make(coeff)*[1;2],...
+        matrix_make(coeff)]*amplitude_fit_function(coeff);
+    matrix_make=@(coeff) [C0'-matrix_make(coeff)*[1;1],...
+        (Times.*C0)'-matrix_make(coeff)*[1;2],...
+        matrix_make(coeff)]*amplitude_fit_function(coeff);
+else
+    amplitude_fit_function =@(coeff) (matrix_make(coeff)'*matrix_make(coeff))^-1*...
+        matrix_make(coeff)'*TAMatrix';%returns atb/ata: a #functions x time matrix
+    fit_function =@(coeff,t) matrix_make(coeff)*amplitude_fit_function(coeff);
+end 
+
+% simple fit options:
+fit_options=optimoptions(@lsqcurvefit,'Algorithm','trust-region-reflective',...
+    'Display','None');
+% Do the actual fitting
+[solution,~,FitResid,~,~,~,J]=lsqcurvefit(fit_function, guess, WLs,...
+    TAMatrix',lower_bounds,upper_bounds,fit_options);
+% Save the kinetics & spectra associated with each kinetic component:
+KinFitKin = matrix_make(solution);
+KinFitSpec = amplitude_fit_function(solution); 
+% Save the overall solution
+TAFit = fit_function(solution)';
+ConfidInt = nlparci(solution,FitResid,'jacobian',J);
+disp('Solution Found, Parameters =')
+for ii=1:length(solution)
+    ErrBar(ii)=diff(ConfidInt(ii,:));
+    SolutionText{ii}=[num2str(solution(ii)),' ± ',...
+        num2str(ErrBar(ii)),' ',TimeUnits];
+    disp(SolutionText{ii})
+end
+
+% Normalize the kinetics to 1 and weight the spectra according to the
+% kinetics:
+clear KinFitWt Lifetime FWHM KinFitSpecNorm
+
+for ii=1:numexps
+    [KinFitWt(ii),mIdx(ii)] = max(abs(KinFitKin(:,ii)));
+    KinFitSpec(ii,:) = KinFitSpec(ii,:).*KinFitWt(ii);
+    KinFitSpecNorm(ii,:) = KinFitSpec(ii,:)./max(abs(KinFitSpec(ii,:)));
+    KinFitKin(:,ii) = KinFitKin(:,ii)./KinFitKin(mIdx(ii),ii);
+    if fittype == 1
+        FWHM = 0;
+        Lifetime{ii} = [num2str(round(solution(ii),3,'significant')) TimeUnits ' Component'];
+    elseif fittype == 2
+        FWHM = 2*sqrt(2*log(2))*solution(1);
+        Lifetime{ii} = [num2str(round(solution(ii+1),3,'significant')) TimeUnits ' Component'];
+    elseif fittype == 4 % EMG(sigma,t0,y0,tau,t)
+        FWHM = solution(1);
+        Lifetime{ii} = [num2str(round(solution(2+ii),3,'significant')) TimeUnits ' Component'];
+    else % if the fittype was 5 or 6
+        Lifetime{ii} = num2str(ii, 'Species %.0f');
+    end
+end
+disp('Fitting Completed')
+
+%% Save fit details
+TextFile = {};
+fID = fopen(['Fit Details (Fittype ' num2str(fittype) ', Params ' ...
+    num2str(numexps) ') ' datestr(datetime('now'),'yyyy-mm-dd_hh_MM') '.txt'],'w');
+TextFile{1} = 'Global Fit Options:';
+for ii = 1:length(GFitOpts)
+    TextFile{2*ii} = [GFitPrompts{ii} ':' GFitOpts{ii}];
+    TextFile{2*ii+1} = '';
+end
+TextFile{length(TextFile)+1} = 'Fit Parameters Returned:';
+TextFile = [TextFile,SolutionText]; % add the fit parameters
+TextFile = TextFile(:); % rotate the string correctly
+for ii = 1:length(TextFile)
+    fprintf(fID,'%s\r\n',TextFile{ii});
+end
+fclose('all');
+
+%% Plotting of Full TA Data
+figure(Fn),clf
+subplot(2,2,1)
+surf(WLs,Times,TAMatrix','linestyle','none'),view(0,90),grid('off')
+axis([min(WLs) max(WLs) min(Times) tmax])
+set(gca,'Layer','top')
+if TimeAsLog == 1
+    set(gca,'yscale','log')
+else
+    set(gca,'yscale','linear')
+end
+caxis([zlims(1) zlims(2)]),colorbar,colormap(bluewhitered)
+title('Data')
+xlabel('Probe Wavelength /nm','fontsize',14)
+ylabel(['Time /' TimeUnits],'fontsize',14)
+
+subplot(2,2,2)
+surf(WLs,Times,TAFit','linestyle','none'),view(0,90),grid('off')
+axis([min(WLs) max(WLs) min(Times) tmax])
+set(gca,'Layer','top')
+if TimeAsLog == 1 
+    set(gca,'yscale','log')
+else
+    set(gca,'yscale','linear')
+end
+caxis([zlims(1) zlims(2)]),colorbar
+title('Reconstruction')
+xlabel('Probe Wavelength /nm','fontsize',14)
+ylabel(['Time /' TimeUnits],'fontsize',14)
+
+Kin_Residual=TAMatrix-TAFit;
+subplot(2,2,[3 4])
+surf(WLs,Times,10.*Kin_Residual','linestyle','none'),view(0,90),grid('off')
+axis([min(WLs) max(WLs) min(Times) tmax])
+set(gca,'Layer','top')
+if TimeAsLog == 1 
+    set(gca,'yscale','log')
+else
+    set(gca,'yscale','linear')
+end
+caxis([zlims(1) zlims(2)]),colorbar
+title('Residual x10')
+xlabel('Probe Wavelength /nm','fontsize',14)
+ylabel(['Time /' TimeUnits],'fontsize',14)
+
+print('Global Fit Residual','-dpng')
+
+% ResFractional = abs(Kin_Residual'./TAMatrix');
+% ResFractional(ResFractional>1)=1;
+% subplot(2,2,4)
+% surf(WLs,Times,ResFractional,'linestyle','none'),view(0,90),grid('off')
+% axis([min(WLs) max(WLs) min(Times) ymax])
+% set(gca,'Layer','top')
+% colorbar
+% title('Residual/Average')
+% xlabel('Probe Wavelength /nm','fontsize',14)
+% ylabel(['Time /' TimeUnits],'fontsize',14)
+
+% Plotting of Spectra and Kinetics
+figure(Fn+1),clf
+subplot(2,2,1)
+plot(Times,KinFitKin)
+title('Retrieved Kinetics')
+axis('tight')
+if TimeAsLog == 1 
+    set(gca,'xscale','log')
+else
+    set(gca,'xscale','linear')
+end
+legend(Lifetime,'location','best','fontsize',12,'AutoUpdate','Off')
+hold on
+plot(Times,zeros(size(Times)),'color','k')
+dlmwrite(['Global Fit Basis Kinetics (' strjoin(Lifetime,', ') ').csv'],...
+    [Times(:) KinFitKin],'delimiter',',','newline','pc')
+xlabel(['Time /' TimeUnits],'fontsize',14)
+ylabel('Relative Population','fontsize',14)
+
+subplot(2,2,2)
+plot(WLs,KinFitSpec)
+title('Retrieved Spectra')
+axis('tight')
+legend(Lifetime,'location','best','fontsize',12,'AutoUpdate','Off')
+hold on
+plot(WLs,zeros(size(WLs)),'color','k')
+dlmwrite(['Global Fit Basis Spectra (' strjoin(Lifetime,', ') ').csv'],...
+    [WLs(:) KinFitSpec'],'delimiter',',','newline','pc')
+xlabel('Probe Wavelength /nm','fontsize',14)
+ylabel('\DeltaA /OD','fontsize',14)
+
+subplot(2,2,[3 4])
+plot(WLs,KinFitSpecNorm)
+title('Retrieved Spectra (Normalized)')
+axis('tight')
+legend(Lifetime,'location','best','fontsize',12,'AutoUpdate','Off')
+hold on
+plot(WLs,zeros(size(WLs)),'color','k')
+xlabel('Probe Wavelength /nm','fontsize',14)
+ylabel('\DeltaA /OD','fontsize',14)
+
+savefig('Global Fit Spectra and Kinetics')
+print('Global Fit Spectra and Kinetics.png','-dpng','-r0') 
+
+disp('Plotting Finished')
+
+%% Data Explorer
+disp('Viewing Data')
+
+SvdSpec = [];
+SvdSpecFit = [];
+KeptWLs = {};
+KeptWLsNum = [];
+SvdKin = [];
+SvdKinFit = [];
+KeptTs = {};
+KeptTsNum = [];
+
+figure(Fn+2),clf
+subplot(2,2,[1 3]);
+hold on
+surf(WLs,Times,TAMatrix','Linestyle','none'),view(0,90),grid('off')
+caxis([zlims(1) zlims(2)])
+colormap('bluewhitered')
+set(gca,'Layer','top')
+if TimeAsLog == 1 
+    set(gca,'yscale','log')
+else
+    set(gca,'yscale','linear')
+end
+colorbar
+axis('tight')
+title(['Left-Click: Get Slices; Mid-Click: Get Avg. Slice' ...
+    newline 'Right-Click: Save Last Slice; Enter: End'],'fontsize',12)
+xlabel('Probe Wavelength /nm','fontsize',14)
+ylabel(['Time /' TimeUnits],'fontsize',14)
+datahandle = gca;
+
+wid = 3; % # slices on either side to average for looking @ slices
+mb = 1;
+zz = 1;
+
+clear('SpecSlice','SpecSliceFit','KinSlice','KinSliceFit')
+while ~isempty(mb)
+    [x,y,mb] = ginput(1);
+    if mb ~= 3
+        xidx = interp1(WLs,1:length(WLs),x,'nearest','extrap');
+        yidx = interp1(Times,1:length(Times),y,'nearest','extrap');
+        disp(['Plotting Slices, Round ' num2str(zz)])
+        zz = zz+1;
+    end    
+    
+    % Get Spectral Slice
+    if mb == 1
+        SpecSlice = TAMatrix(:,yidx);
+        SpecSliceFit = TAFit(:,yidx);
+    elseif mb == 2
+        yidxs = yidx-wid; 
+        yidxs = yidxs*(yidxs>=1)+(yidxs<1)*1; % round it to 1 if needed
+        yidxf = yidx+wid; 
+        yidxf = yidxf*(length(Times)-yidxf>=0)+(length(Times)-yidxf<0)*length(Times); % round to last pt if needed
+        SpecSlice = mean(TAMatrix(:,yidxs:yidxf),2);
+        SpecSliceFit = mean(TAFit(:,yidxs:yidxf),2);
+    end
+    
+    if exist('SpecSlice','var')
+    SpecResid = SpecSlice - SpecSliceFit;
+    subplot(2,2,2),cla
+    hold on
+    plot(WLs,SpecSlice)
+    plot(WLs,SpecSliceFit)
+    title(['Spectral Slice at ' num2str(round(Times(yidx),2,'significant')) TimeUnits],'fontsize',14)
+    xlabel('Wavelength /nm','fontsize',14)
+    legend({'Data','Fit'},'location','best','fontsize',14,'AutoUpdate','Off')
+    xlim([min(WLs) max(WLs)])
+%     ylim([zlims(1) zlims(2)])
+    plot(WLs,zeros(size(WLs)),'color','k')
+    spechandle = gca;
+    end
+    
+    % Get Kinetic Slice
+    if mb == 1
+        KinSlice = TAMatrix(xidx,:);
+        KinSliceFit = TAFit(xidx,:);
+    elseif mb == 2
+        xidxs = xidx-wid;
+        xidxs = xidxs*(xidxs>=1)+(xidxs<1)*1; % round it to 1 if needed
+        xidxf = xidx+wid; 
+        xidxf = xidxf*(length(WLs)-xidxf>=0)+(length(WLs)-xidxf<0)*length(WLs); % round to last pt if needed
+        KinSlice = mean(TAMatrix(xidxs:xidxf,:),1);
+        KinSliceFit = mean(TAFit(xidxs:xidxf,:),1);
+    end
+    
+    if exist('KinSlice','var')
+    KinResid = KinSlice - KinSliceFit;
+    subplot(2,2,4),cla
+    hold on
+    plot(Times,KinSlice)
+    plot(Times,KinSliceFit)
+    xlim([1 10000])
+    title(['Kinetic Slice at ' num2str(WLs(xidx)',3) 'nm'],'fontsize',14)
+    xlabel(['Time /' TimeUnits],'fontsize',14)
+    legend({'Data','Fit'},'location','best','fontsize',14,'AutoUpdate','Off')
+    xlim([min(Times) tmax])
+%     ylim([zlims(1) zlims(2)])
+    plot(Times,zeros(size(Times)),'color','k')
+    if TimeAsLog == 1 
+        set(gca,'xscale','log')
+    else
+        set(gca,'xscale','linear')
+    end
+    kinhandle = gca;
+    end
+    
+    % add crosshair to Matrix Plot
+    try
+        if mb == 1 || mb == 2
+            axes(datahandle)
+            if exist('hvert','var')
+                delete(hvert)
+                delete(hhoriz)
+            end
+            hvert = plot3([x x],get(gca,'ylim'),[max(get(gca,'zlim')) max(get(gca,'zlim'))]+0.001,'color','k');
+            hhoriz = plot3(get(gca,'xlim'),[y y],[max(get(gca,'zlim')) max(get(gca,'zlim'))]+0.001,'color','k');
+        end
+    catch
+        % you end up here on the last loop iteration (when you hit enter)
+    end
+    
+    if mb == 3
+       print([num2str(WLs(xidx)',3) 'nm and ' num2str(round(Times(yidx),2,'significant')) TimeUnits '.png'],'-dpng','-r0') 
+       SvdSpec = [SvdSpec,SpecSlice];
+       SvdSpecFit = [SvdSpecFit,SpecSliceFit];
+       KeptWLs = [KeptWLs,{num2str(WLs(xidx),'%.0f nm')}];
+       KeptWLsNum = [KeptWLsNum,WLs(xidx)];
+       SvdKin = [SvdKin;KinSlice];
+       SvdKinFit = [SvdKinFit;KinSliceFit];
+       KeptTs = [KeptTs,{[num2str(round(Times(yidx),2,'significant')) TimeUnits]}];
+       KeptTsNum = [KeptTsNum,Times(yidx)];
+       dlmwrite([num2str(WLs(xidx)',3),'nm.csv'],[Times',KinSlice',KinSliceFit'])
+       dlmwrite([num2str(round(Times(yidx),2,'significant')) TimeUnits '.csv'],[WLs,SpecSlice,SpecSliceFit])
+    end
+end
+disp('Done Viewing Data')
+
+% Sort the sliced data
+if ~isempty(KeptTsNum)
+    [KeptTsNum,sIndT] = sort(KeptTsNum);
+    [KeptWLsNum,sIndW] = sort(KeptWLsNum);
+    SvdSpec = SvdSpec(:,sIndT);
+    SvdSpecFit = SvdSpecFit(:,sIndT);
+    KeptTs = KeptTs(sIndT);
+    SvdKin = SvdKin(sIndW,:);
+    SvdKinFit = SvdKinFit(sIndW,:);
+    KeptWLs = KeptWLs(sIndW);
+    AnySavSlice = 1;
+else
+    disp('No Slices Saved')
+    AnySavSlice = 0;
+end
+
+if mb == 2
+    figure(Fn+3),clf
+    plot(Times,KinResid)
+    cftool(Times,KinResid)
+end
+
+%% Now plot the saved (right clicked) spectra and kinetics 
+if AnySavSlice
+    NumKeepers = size(SvdSpec,2);
+    Colors = jet(NumKeepers);
+    figure(Fn+4), clf, hold on
+    clear plots
+    for ii=1:NumKeepers
+        scatter(WLs,SvdSpec(:,ii),8,Colors(ii,:),'filled')
+        plots(ii) = plot(WLs,SvdSpecFit(:,ii),'color',0.9*Colors(ii,:)); 
+    end
+    legend(plots,KeptTs)
+    plot([WLs(1),WLs(end)],[0,0],'k')
+    axis('tight')
+    print('SpectraAndFits.png','-dpng','-r0')
+
+    figure(Fn+5), clf, hold on
+    clear plots
+    for ii=1:NumKeepers
+        scatter(Times,SvdKin(ii,:)./max(SvdKin(ii,:)),8,Colors(ii,:),'filled')
+        plots(ii)=plot(Times,SvdKinFit(ii,:)./max(SvdKin(ii,:)),'color',0.9*Colors(ii,:));
+    end
+    if TimeAsLog == 1 
+        set(gca,'xscale','log')
+    else
+        set(gca,'xscale','linear')
+    end
+    legend(plots,KeptWLs)
+    plot([Times(1),Times(end)],[0,0],'k')
+    axis('tight')
+    print('NormKineticsAndFits.png','-dpng','-r0')
+    
+    for ii=1:NumKeepers
+        figure(Fn+5+ii), clf
+        subplot(4,1,2:4), hold on
+        scatter(Times,SvdKin(ii,:),12,Colors(ii,:),'filled')
+        plot(Times,SvdKinFit(ii,:),'color',0.9*Colors(ii,:))
+        plot([Times(1),Times(end)],[0,0],'k')
+        if TimeAsLog == 1 
+            set(gca,'xscale','log')
+        else
+            set(gca,'xscale','linear')
+        end
+        axis('tight')
+        subplot(4,1,1), hold on
+        title(KeptWLs(ii))
+        plot(Times,SvdKin(ii,:)-SvdKinFit(ii,:),'color',0.9*Colors(ii,:))
+        if TimeAsLog == 1 
+            set(gca,'xscale','log')
+        else
+            set(gca,'xscale','linear')
+        end
+        plot([Times(1),Times(end)],[0,0],'k')
+        axis('tight')
+    end
+end
+Fn = GetFigNum();
+
+%% Redistribution of spectral characteristics from one mode to another
+NormThem = 1; % should the basis spectra be plotted normalized?
+maxindex = 1; % where to do the redistribution, e.g. at first point of kinetics
+
+if numexps > 1
+EASModel = menu('Choose EAS Model',...
+    ['A ' char(8594) ' B (2 Species)'],...
+    ['A ' char(8594) ' B & C ' char(8594) ' 0 (3 Species)'],...
+    ['A ' char(8594) ' 0 & B ' char(8594) ' C (3 Species)'],...
+    ['A ' char(8594) ' B ' char(8594) ' C (3 Species)'],...
+    ['A ' char(8594) ' C ' char(8594) ' D, B ' char(8594) ' 0 (4 Species)'],...
+    ['A ' char(8594) ' B ' char(8594) ' C ' char(8594) ' D (4 Species)']);
+else
+    disp('Skipping EAS Stuff; Only 1 Exponential')
+    return    
+end
+
+if EASModel == 0
+    return
+elseif EASModel == 1 % A ? B (2 Species)
+    ModelString = ['A ' char(8594) ' B (2 Species)'];
+    WhichSpecs = [1,2]; %Choose which spectra to move amplitude from
+    NewSpecs = KinFitSpec(WhichSpecs,:); % grab 2nd & 3rd basis spectra
+    NewKins = KinFitKin(:,WhichSpecs); % grab the 2nd & 3rd basis kinetics
+    [~,maxindex] = max(NewKins);
+    NormConst = NewKins(min(maxindex),2)/NewKins(min(maxindex),1); % make sure it stays norm'd
+    NewSpecs(1,:)= NewSpecs(1,:) + NormConst.*NewSpecs(2,:); % move amplitude between spectra
+    NewKins(:,2) = NewKins(:,2) - NormConst.*NewKins(:,1); % adjust kinetics accordingly
+elseif EASModel == 2 % A ? B & C ? 0 (3 Species)
+    ModelString = ['A ' char(8594) ' B & C ' char(8594) ' 0 (3 Species)'];
+    WhichSpecs = [1,2,3]; %Choose which spectra to move amplitude from
+    NewSpecs = KinFitSpec(WhichSpecs,:); % grab 2nd & 3rd basis spectra
+    NewKins = KinFitKin(:,WhichSpecs); % grab the 2nd & 3rd basis kinetics
+    [~,maxindex] = max(NewKins);
+    NormConst = NewKins(min(maxindex),2)/NewKins(min(maxindex),1); % make sure it stays norm'd
+    NewSpecs(1,:)= NewSpecs(1,:) + NormConst.*NewSpecs(2,:); % move amplitude between spectra
+    NewKins(:,2) = NewKins(:,2) - NormConst.*NewKins(:,1); % adjust kinetics accordingly
+elseif EASModel == 3 % A ? 0 & B ? C (3 Species)
+    ModelString = ['A ' char(8594) ' 0 & B ' char(8594) ' C (3 Species)'];
+    WhichSpecs = [1,2,3]; %Choose which spectra to move amplitude from
+    NewSpecs = KinFitSpec(WhichSpecs,:); % grab 2nd & 3rd basis spectra
+    NewKins = KinFitKin(:,WhichSpecs); % grab the 2nd & 3rd basis kinetics
+    [~,maxindex] = max(NewKins);
+    NormConst = NewKins(min(maxindex),2)/NewKins(min(maxindex),1); % make sure it stays norm'd
+    NewSpecs(2,:)= NewSpecs(2,:) + NormConst.*NewSpecs(3,:); % move amplitude between spectra
+    NewKins(:,3) = NewKins(:,3) - NormConst.*NewKins(:,2); % adjust kinetics accordingly
+elseif EASModel == 4 % A ? B ? C (3 Species)
+    ModelString = ['A ' char(8594) ' B ' char(8594) ' C (3 Species)'];
+    WhichSpecs = [1,2,3]; %Choose which spectra to move amplitude from
+    NewSpecs = KinFitSpec(WhichSpecs,:); % grab basis spectra
+    NewKins = KinFitKin(:,WhichSpecs); % grab the basis kinetics
+    [~,maxindex] = max(NewKins);
+    NormConst = NewKins(min(maxindex),2)/NewKins(min(maxindex),1); % make sure it stays norm'd
+    NewSpecs(1,:) = NewSpecs(1,:) + NormConst.*NewSpecs(2,:) + NormConst.*NewSpecs(3,:); % move amplitude between spectra
+    NewSpecs(2,:) = NormConst.*NewSpecs(2,:) + NormConst.*NewSpecs(3,:); % move amplitude between spectra
+    NewKins(:,2) = NewKins(:,2) - NormConst.*NewKins(:,1); % adjust kinetics accordingly
+    NewKins(:,3) = NewKins(:,3) - NormConst.*NewKins(:,1) - NormConst.*NewKins(:,2); % adjust kinetics accordingly
+elseif EASModel == 5 % A ? C ? D, B ? 0 (4 Species)
+    ModelString = ['A ' char(8594) ' C ' char(8594) ' D, B ' char(8594) ' 0 (4 Species)'];
+    WhichSpecs = [1,2,3,4]; %Choose which spectra to move amplitude from
+    NewSpecs = KinFitSpec(WhichSpecs,:); % grab basis spectra
+    NewKins = KinFitKin(:,WhichSpecs); % grab the basis kinetics
+    NewSpecs(1,:) = NewSpecs(1,:) + NewSpecs(3,:) + NewSpecs(4,:); % move amplitude between spectra
+	NewSpecs(3,:) = NewSpecs(3,:) + NewSpecs(4,:); % move amplitude between spectra
+    NewKins(:,3) = NewKins(:,3) - NewKins(:,1); % adjust kinetics accordingly
+    NewKins(:,4) = NewKins(:,4) - NewKins(:,3) - NewKins(:,1); % adjust kinetics accordingly
+elseif EASModel == 6 % A ? B ? C ? D (4 Species)
+    ModelString = ['A ' char(8594) ' B ' char(8594) ' C ' char(8594) ' D (4 Species)'];
+    WhichSpecs = [1,2,3,4]; %Choose which spectra to move amplitude from
+    NewSpecs = KinFitSpec(WhichSpecs,:); % grab basis spectra
+    NewKins = KinFitKin(:,WhichSpecs); % grab the basis kinetics
+    [~,maxindex] = max(NewKins);
+    NormConst = NewKins(min(maxindex),2)/NewKins(min(maxindex),1); % make sure it stays norm'd
+    NewSpecs(1,:) = NewSpecs(1,:) + NormConst.*NewSpecs(2,:) + NormConst.*NewSpecs(3,:) + NormConst.*NewSpecs(4,:); % move amplitude between spectra
+	NewSpecs(2,:) = NormConst.*NewSpecs(2,:) + NormConst.*NewSpecs(3,:) + NormConst.*NewSpecs(3,:); % move amplitude between spectra
+    NewSpecs(3,:) = NormConst.*NewSpecs(3,:) + NormConst.*NewSpecs(4,:); % move amplitude between spectra
+    NewKins(:,2) = NewKins(:,2) - NormConst.*NewKins(:,1); % adjust kinetics accordingly
+    NewKins(:,3) = NewKins(:,3) - NormConst.*NewKins(:,1) - NormConst.*NewKins(:,2); % adjust kinetics accordingly
+    NewKins(:,4) = NewKins(:,4) - NormConst.*NewKins(:,1) - NormConst.*NewKins(:,2) - NormConst.*NewKins(:,3); % adjust kinetics accordingly
+end
+
+figure(Fn+1),clf
+subplot(2,1,1)
+hold on
+for ii = 1:size(NewSpecs,1)
+    if NormThem == 1
+        plot(WLs,NewSpecs(ii,:)'./max(NewSpecs(ii,:)))
+    else
+        plot(WLs,NewSpecs(ii,:)')
+    end
+end
+plot(WLs,zeros(size(WLs)),'color','k') % add a zero line
+axis tight
+legend(Lifetime(WhichSpecs),'location','best','fontsize',14)
+xlabel('Wavelength /nm')
+ylabel('\DeltaA /OD')
+title(ModelString)
+subplot(2,1,2)
+hold on
+for ii = 1:size(NewSpecs,1)
+    plot(Times,NewKins(:,ii))
+end
+axis tight
+if TimeAsLog == 1 
+    set(gca,'xscale','log')
+else
+    set(gca,'xscale','linear')
+end
+xlabel(['Time /' TimeUnits])
+ylabel('\DeltaA /OD')
+legend(Lifetime(WhichSpecs),'location','best','fontsize',14)
+
+% Check difference from original DAS fit
+disp(['EAS vs. DAS cumulative difference: '...
+    num2str(max(max(NewKins*NewSpecs-KinFitKin(:,WhichSpecs)*KinFitSpec(WhichSpecs,:)))) ...
+    ' (should be small)'])
+
+print('Global Fit Species Associated Spectra and Kinetics','-dpng','-r0') 
+
+dlmwrite(['Global Fit Basis Kinetics, Redistributed (' strjoin(Lifetime(WhichSpecs),', ') ').csv'],...
+    [Times(:) NewKins],'delimiter',',','newline','pc')
+dlmwrite(['Global Fit Basis Spectra, Redistributed (' strjoin(Lifetime(WhichSpecs),', ') ').csv'],...
+    [WLs(:) NewSpecs'],'delimiter',',','newline','pc')
+
+%% Spectral Smoothing/EXTREMA DETERMINATION
+if SpecSmoothParam > 0
+    figure(Fn+2),clf
+    hold on
+    TenTwenFo = max(size(WLs));
+    for ii = 1:size(NewSpecs(:,1),1)
+        SmoothedSpecs(ii,:) = movmean(NewSpecs(ii,:),SpecSmoothParam);
+        [Maxima{ii}, MaxIDCs{ii}, Minima{ii}, MinIDCs{ii}] = extrema(SmoothedSpecs(ii,:));
+        ExtremaIDCs{ii} = cat(2,MaxIDCs{ii},MinIDCs{ii});
+        Extrema{ii} = cat(2,Maxima{ii},Minima{ii});
+        ExtremaIDCsNoZeros{ii} = ExtremaIDCs{ii}(Extrema{ii} ~= 0);
+        ExtremaWLs{ii} = sort(WLs(ExtremaIDCsNoZeros{ii}))';
+        disp(['Component ' num2str(ii) ' Extrema: ' num2str(ExtremaWLs{ii})])
+        plot(WLs, NewSpecs(ii,:)')
+        plot(WLs, SmoothedSpecs(ii,:)')
+        label{ii*2 - 1} = ['Component ' num2str(ii) ' Raw'];
+        label{ii*2} = ['Component ' num2str(ii) ' Smoothed'];
+    end 
+    legend(label{:})
+    fileID = fopen('Extrema - Redistributed Spectra.csv','w');
+    fprintf(fileID, 'Note: Highest and lowest wavelength values always included\r\n');
+    fprintf(fileID, ['Smoothing used moving average of %d nearest neighbors.\r\n'...
+        'Beware of extrema near pump scatter region.\r\n\r\n'], SpecSmoothParam);
+    for ii = 1:size(NewSpecs(:,1),1) 
+        fprintf(fileID, '%16s Extrema Wavelengths(nm): ', Lifetime{ii});
+        for i = 1:max(size(ExtremaWLs{ii}))
+            fprintf(fileID, '%6.2f%2s', ExtremaWLs{ii}(i), ', ');
+        end
+        fprintf(fileID, '\r\n \r\n');
+    end 
+    fclose(fileID);
+end
+function [xmax,imax,xmin,imin] = extrema(x)
+%% Define Extrema Finder Function
+xmax = [];
+imax = [];
+xmin = [];
+imin = [];
+
+% Vector input?
+Nt = numel(x);
+if Nt ~= length(x)
+ error('Entry must be a vector.')
+end
+
+% NaN's:
+inan = find(isnan(x));
+indx = 1:Nt;
+if ~isempty(inan)
+ indx(inan) = [];
+ x(inan) = [];
+ Nt = length(x);
+end
+
+% Difference between subsequent elements:
+dx = diff(x);
+
+% Is an horizontal line?
+if ~any(dx)
+ return
+end
+
+% Flat peaks? Put the middle element:
+a = find(dx~=0);              % Indexes where x changes
+lm = find(diff(a)~=1) + 1;    % Indexes where a do not changes
+d = a(lm) - a(lm-1);          % Number of elements in the flat peak
+a(lm) = a(lm) - floor(d/2);   % Save middle elements
+a(end+1) = Nt;
+
+% Peaks?
+xa  = x(a);             % Serie without flat peaks
+b = (diff(xa) > 0);     % 1  =>  positive slopes (minima begin)  
+                        % 0  =>  negative slopes (maxima begin)
+xb  = diff(b);          % -1 =>  maxima indexes (but one) 
+                        % +1 =>  minima indexes (but one)
+imax = find(xb == -1) + 1; % maxima indexes
+imin = find(xb == +1) + 1; % minima indexes
+imax = a(imax);
+imin = a(imin);
+
+nmaxi = length(imax);
+nmini = length(imin);                
+
+% Maximum or minumim on a flat peak at the ends?
+if (nmaxi==0) && (nmini==0)
+ if x(1) > x(Nt)
+  xmax = x(1);
+  imax = indx(1);
+  xmin = x(Nt);
+  imin = indx(Nt);
+ elseif x(1) < x(Nt)
+  xmax = x(Nt);
+  imax = indx(Nt);
+  xmin = x(1);
+  imin = indx(1);
+ end
+ return
+end
+
+% Maximum or minumim at the ends?
+if (nmaxi==0) 
+ imax(1:2) = [1 Nt];
+elseif (nmini==0)
+ imin(1:2) = [1 Nt];
+else
+ if imax(1) < imin(1)
+  imin(2:nmini+1) = imin;
+  imin(1) = 1;
+ else
+  imax(2:nmaxi+1) = imax;
+  imax(1) = 1;
+ end
+ if imax(end) > imin(end)
+  imin(end+1) = Nt;
+ else
+  imax(end+1) = Nt;
+ end
+end
+xmax = x(imax);
+xmin = x(imin);
+
+% NaN's:
+if ~isempty(inan)
+ imax = indx(imax);
+ imin = indx(imin);
+end
+
+% Same size as x:
+imax = reshape(imax,size(xmax));
+imin = reshape(imin,size(xmin));
+
+% Descending order:
+[~,inmax] = sort(-xmax);
+xmax = xmax(inmax);
+imax = imax(inmax);
+[xmin,inmin] = sort(xmin);
+imin = imin(inmin);
+
+end
+% Carlos Adrián Vargas Aguilera. nubeobscura@hotmail.com
+
+%% Options
+% Surpress error messages for:
+% using str2num
+%#ok<*ST2NM>
+% arguments that grow during loops
+%#ok<*SAGROW>
+%#ok<*AGROW>
+% calling axes in a loop
+%#ok<*LAXES>
+%% Changelog
+%{
+2018-06-04 The program now prints error bars for least squares fit 
+components and includes that in the "Fit Details" text file. Fixed a crash
+when loading existing data and hitting enter in the fit explorer. Also,
+added some options (see above) to surpress error messages.  - SGS
+
+2018-03-19 Now plots the right-click saved kinetics and residuals -SGS
+
+2017-10-30 Added A -> B -> C -> D SAD model - SMS
+
+2017-02-15 Updated to use GetFigNum() to grab figure number.
+
+2017-01-31 Added another fit type, for double binding events.
+
+2017-01-30 Now the pump scater regions are deleted from the data, rather
+than made into 0's -SGS
+
+2017-01-27 Added binding studies fitting -SGS
+
+2017-01-24 Added Extrema Determination functionality -RDD
+
+2017-01-18 Added text file with fit details, etc. -JDC
+
+2017-01-18 Now any WLs or times that are saved (right clicked) will be
+plotted in a one final plot alongside the fits. -SGS
+
+2017-01-18 Added in another (4 exponential) SAS calculation to handle the
+triplet sensitization experiment. -JDC
+
+2017-01-03 Updated mehtodology for generating crosshairs plots to use
+current axis limits. Also updated dialogue box to be more useful at the
+beginning when it asks for pump scatter regions.
+
+2017-01-02 Added in dialog box at beginning to make it less confusing to
+use parameters. Dialogue box is reset whenever you choose load new data.
+Also clarified EAS vs. DAS check and added zero line to spectra. Added
+minor annotations in EAS section. JDC.
+
+2016-12-26 Added in selection for the type of mode redistribution to do
+when computing EAS. Tested with a 3 exponential data set and all 4 types so
+far gave expected results. JDC.
+
+2016-12-16 Added a fifth fitting method. Now fits variable-temp UV-Vis
+data. SGS.
+
+2016-12-07 When you save a slice, two .csv files with the data and fit of
+the spectrum and kinetic trace are saved. SGS.
+
+2016-12-06 Enabled autoscaling of y axes on slices when exploring global
+fit results.
+
+2016-11-21 Added global fit to ExpModGauss Function (works well w/ TRPL)
+
+2016-09-13 Fixed some axis labels and removed an unnecessary figure.
+
+2016-07-27 Added saving of basis spectra and kinetics to delimited text files.
+
+2016-07-08 Now saves a figure when you right click. Use enter when done.
+    -I can't seem to quit if I've just saved a figure (rt click).
+    -Enter works just fine when you've last left or middle clicked.
+2016-07-05 Added middle-click to see 3-spectrum average
+2016-06-28 Updated for fitting Quantronix TA data
+    -Visualization of fit slices vs. raw data slices
+    -Arbitrary # of exponentials to fit to
+    -Choose fitting model (cexp or exponential)
+
+yyyy-mm-dd Note
+    -Subnote
+    -Subnote
+%}
